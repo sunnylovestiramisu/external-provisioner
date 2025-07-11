@@ -444,6 +444,7 @@ func main() {
 		nodeDeployment,
 		*controllerPublishReadOnly,
 		*preventVolumeModeConversion,
+		&provisionController.SelectedNodeTopologies,
 	)
 
 	var capacityController *capacity.Controller

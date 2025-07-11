@@ -23,6 +23,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -145,8 +146,7 @@ const (
 	// and used at pvc deletion time.
 	annDeletionProvisionerSecretRefName      = "volume.kubernetes.io/provisioner-deletion-secret-name"
 	annDeletionProvisionerSecretRefNamespace = "volume.kubernetes.io/provisioner-deletion-secret-namespace"
-
-	snapshotNotBound = "snapshot %s not bound"
+	snapshotNotBound                         = "snapshot %s not bound"
 
 	pvcCloneFinalizer = "provisioner.storage.kubernetes.io/cloning-protection"
 
@@ -278,6 +278,7 @@ type csiProvisioner struct {
 	nodeDeployment                        *internalNodeDeployment
 	controllerPublishReadOnly             bool
 	preventVolumeModeConversion           bool
+	selectedNodeTopologies                *sync.Map
 }
 
 var (
@@ -359,6 +360,7 @@ func NewCSIProvisioner(client kubernetes.Interface,
 	nodeDeployment *NodeDeployment,
 	controllerPublishReadOnly bool,
 	preventVolumeModeConversion bool,
+	selectedNodeTopologies *sync.Map,
 ) controller.Provisioner {
 	broadcaster := record.NewBroadcaster()
 	broadcaster.StartLogging(klog.Infof)
@@ -394,6 +396,7 @@ func NewCSIProvisioner(client kubernetes.Interface,
 		eventRecorder:                         eventRecorder,
 		controllerPublishReadOnly:             controllerPublishReadOnly,
 		preventVolumeModeConversion:           preventVolumeModeConversion,
+		selectedNodeTopologies:                selectedNodeTopologies,
 	}
 	if nodeDeployment != nil {
 		provisioner.nodeDeployment = &internalNodeDeployment{
@@ -693,7 +696,8 @@ func (p *csiProvisioner) prepareProvision(ctx context.Context, claim *v1.Persist
 			p.strictTopology,
 			p.immediateTopology,
 			p.csiNodeLister,
-			p.nodeLister)
+			p.nodeLister,
+			p.selectedNodeTopologies)
 		if err != nil {
 			return nil, controller.ProvisioningNoChange, fmt.Errorf("error generating accessibility requirements: %v", err)
 		}
@@ -940,6 +944,10 @@ func (p *csiProvisioner) Provision(ctx context.Context, options controller.Provi
 
 	if p.supportsTopology() {
 		pv.Spec.NodeAffinity = GenerateVolumeNodeAffinity(rep.Volume.AccessibleTopology)
+		if options.SelectedNode != nil {
+			keys := getTopologyKeysFromAccessibleTopology(rep.Volume.AccessibleTopology)
+			p.selectedNodeTopologies.Store(options.SelectedNode.Name, keys)
+		}
 	}
 
 	// Set VolumeMode to PV if it is passed via PVC spec when Block feature is enabled
@@ -1495,7 +1503,8 @@ func (p *csiProvisioner) checkNode(ctx context.Context, claim *v1.PersistentVolu
 				p.strictTopology,
 				p.immediateTopology,
 				p.csiNodeLister,
-				p.nodeLister); err != nil {
+				p.nodeLister,
+				p.selectedNodeTopologies); err != nil {
 				if logger.Enabled() {
 					logger.Infof("%s: ignoring PVC %s/%s, allowed topologies is not compatible: %v", caller, claim.Namespace, claim.Name, err)
 				}

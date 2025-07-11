@@ -19,6 +19,7 @@ package controller
 import (
 	"fmt"
 	"slices"
+	"sync"
 	"testing"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -403,6 +404,7 @@ func TestStatefulSetSpreading(t *testing.T) {
 
 	for name, tc := range testcases {
 		t.Run(name, func(t *testing.T) {
+			var selectedNodeTopologiesCache sync.Map
 			for strictTopology, withOrWithout := range withWithout {
 				t.Run(withOrWithout+" strict topology", func(t *testing.T) {
 					for immediateTopology, withOrWithout := range withWithout {
@@ -417,6 +419,7 @@ func TestStatefulSetSpreading(t *testing.T) {
 								immediateTopology,
 								csiNodeLister,
 								nodeLister,
+								&selectedNodeTopologiesCache,
 							)
 
 							if err != nil {
@@ -812,6 +815,7 @@ func TestAllowedTopologies(t *testing.T) {
 				t.Run(withOrWithout+" strict topology", func(t *testing.T) {
 					for immediateTopology, withOrWithout := range withWithout {
 						t.Run(withOrWithout+" immediate topology", func(t *testing.T) {
+							var selectedNodeTopologiesCache sync.Map
 							requirements, err := GenerateAccessibilityRequirements(
 								nil,           /* kubeClient */
 								"test-driver", /* driverName */
@@ -822,6 +826,7 @@ func TestAllowedTopologies(t *testing.T) {
 								immediateTopology,
 								nil,
 								nil,
+								&selectedNodeTopologiesCache,
 							)
 
 							if err != nil {
@@ -1092,6 +1097,8 @@ func TestTopologyAggregation(t *testing.T) {
 							if tc.hasSelectedNode {
 								selectedNode = &nodes.Items[0]
 							}
+
+							var selectedNodeTopologiesCache sync.Map
 							requirements, err := GenerateAccessibilityRequirements(
 								kubeClient,
 								testDriverName,
@@ -1102,6 +1109,7 @@ func TestTopologyAggregation(t *testing.T) {
 								immediateTopology,
 								csiNodeLister,
 								nodeLister,
+								&selectedNodeTopologiesCache,
 							)
 
 							expectError := tc.expectError
@@ -1414,6 +1422,7 @@ func TestPreferredTopologies(t *testing.T) {
 							_, csiNodeLister, nodeLister, _, _, stopChan := listers(kubeClient)
 							defer close(stopChan)
 
+							var selectedNodeTopologiesCache sync.Map
 							requirements, err := GenerateAccessibilityRequirements(
 								kubeClient,
 								testDriverName,
@@ -1424,6 +1433,7 @@ func TestPreferredTopologies(t *testing.T) {
 								immediateTopology,
 								csiNodeLister,
 								nodeLister,
+								&selectedNodeTopologiesCache,
 							)
 
 							if tc.expectError && err == nil {

@@ -48,6 +48,7 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	corelistersv1 "k8s.io/client-go/listers/core/v1"
+	storagelistersv1 "k8s.io/client-go/listers/storage/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
@@ -122,6 +123,8 @@ type ProvisionController struct {
 	volumes        cache.Store
 	classInformer  cache.SharedInformer
 	nodeLister     corelistersv1.NodeLister
+	csiNodeLister  storagelistersv1.CSINodeLister
+	scLister       storagelistersv1.StorageClassLister
 	classes        cache.Store
 
 	// To determine if the informer is internal or external
@@ -179,6 +182,9 @@ type ProvisionController struct {
 
 	// Map UID -> *PVC with all claims that may be provisioned in the background.
 	claimsInProgress sync.Map
+
+	// Map nodeName to topologies
+	SelectedNodeTopologies sync.Map
 
 	volumeStore VolumeStore
 
@@ -1114,6 +1120,26 @@ func (ctrl *ProvisionController) syncClaim(ctx context.Context, obj interface{})
 			// Provisioning is in progress in background.
 			logger.V(2).Info("Temporary error received, adding PVC to claims in progress", "claimUID", claim.UID)
 			ctrl.claimsInProgress.Store(string(claim.UID), claim)
+
+			if selectedNodeName, ok := getString(claim.Annotations, annSelectedNode, annAlphaSelectedNode); ok {
+				selectedCSINode, err := ctrl.csiNodeLister.Get(selectedNodeName)
+				// OR should we make it non blocking ?
+				if err != nil {
+					// We don't want to fallback and provision in the wrong topology if there's some temporary
+					// error with the API server.
+					return fmt.Errorf("error getting CSINode for selected node %q: %v", selectedNodeName, err)
+				}
+				if selectedCSINode == nil {
+					return fmt.Errorf("CSINode for selected node %q not found", selectedNodeName)
+				}
+				storageClass, err := ctrl.scLister.Get(*claim.Spec.StorageClassName)
+				if err != nil {
+					return fmt.Errorf("error getting storageClass for claim %q: %v", claim.Name, err)
+				}
+				driverName := storageClass.Provisioner
+				topologyKeys := getTopologyKeys(selectedCSINode, driverName)
+				ctrl.SelectedNodeTopologies.Store(selectedNodeName, topologyKeys)
+			}
 		} else {
 			// status == ProvisioningNoChange.
 			// Don't change claimsInProgress:
@@ -1573,6 +1599,22 @@ func (ctrl *ProvisionController) deleteVolumeOperation(ctx context.Context, volu
 
 	logger.V(4).Info("Volume deleted")
 
+	// Delete the volume from selectedNodeTopologies cache
+	if volume.Spec.ClaimRef != nil {
+		objs, err := ctrl.claimsIndexer.ByIndex(uidIndex, string(volume.Spec.ClaimRef.UID))
+		if err != nil {
+			logger.Error(err, "Error getting claim from cache")
+			// Do not return error, just log it. Deletion of PV should proceed.
+		} else if len(objs) > 0 {
+			if claim, ok := objs[0].(*v1.PersistentVolumeClaim); ok {
+				if selectedNodeName, ok := getString(claim.Annotations, annSelectedNode, annAlphaSelectedNode); ok {
+					logger.V(4).Info("Deleting selected node from cache", "node", selectedNodeName)
+					ctrl.SelectedNodeTopologies.Delete(selectedNodeName)
+				}
+			}
+		}
+	}
+
 	// Delete the volume
 	if err = ctrl.client.CoreV1().PersistentVolumes().Delete(ctx, volume.Name, metav1.DeleteOptions{}); err != nil {
 		// Oops, could not delete the volume and therefore the controller will
@@ -1718,4 +1760,13 @@ func getString(m map[string]string, key string, alts ...string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func getTopologyKeys(csiNode *storage.CSINode, driverName string) []string {
+	for _, driver := range csiNode.Spec.Drivers {
+		if driver.Name == driverName {
+			return driver.TopologyKeys
+		}
+	}
+	return nil
 }

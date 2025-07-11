@@ -23,6 +23,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/kubernetes-csi/csi-lib-utils/rpc"
@@ -147,7 +148,8 @@ func GenerateAccessibilityRequirements(
 	strictTopology bool,
 	immediateTopology bool,
 	csiNodeLister storagelistersv1.CSINodeLister,
-	nodeLister corelisters.NodeLister) (*csi.TopologyRequirement, error) {
+	nodeLister corelisters.NodeLister,
+	selectedNodeTopologies *sync.Map) (*csi.TopologyRequirement, error) {
 	requirement := &csi.TopologyRequirement{}
 
 	var (
@@ -174,7 +176,13 @@ func GenerateAccessibilityRequirements(
 			//
 			// Returning an error in provisioning will cause the scheduler to retry and potentially
 			// (but not guaranteed) pick a different node.
-			return nil, fmt.Errorf("no topology key found on CSINode %s", selectedCSINode.Name)
+
+			// Add extra step to check the selectedNodeTopologies cache
+			if topology, ok := selectedNodeTopologies.Load(selectedNode.Name); ok {
+				topologyKeys = topology.([]string)
+			} else {
+				return nil, fmt.Errorf("no topology key found on CSINode %s", selectedCSINode.Name)
+			}
 		}
 		var isMissingKey bool
 		selectedTopology, isMissingKey = getTopologyFromNode(selectedNode, topologyKeys)
@@ -216,7 +224,7 @@ func GenerateAccessibilityRequirements(
 			}
 
 			// Aggregate existing topologies in nodes across the entire cluster.
-			requisiteTerms, err = aggregateTopologies(driverName, selectedCSINode, csiNodeLister, nodeLister)
+			requisiteTerms, err = aggregateTopologies(driverName, selectedCSINode, csiNodeLister, nodeLister, selectedNodeTopologies)
 			if err != nil {
 				return nil, err
 			}
@@ -300,7 +308,8 @@ func aggregateTopologies(
 	driverName string,
 	selectedCSINode *storagev1.CSINode,
 	csiNodeLister storagelistersv1.CSINodeLister,
-	nodeLister corelisters.NodeLister) ([]topologyTerm, error) {
+	nodeLister corelisters.NodeLister,
+	selectedNodeTopologies *sync.Map) ([]topologyTerm, error) {
 
 	// 1. Determine topologyKeys to use for aggregation
 	var topologyKeys []string
@@ -345,6 +354,11 @@ func aggregateTopologies(
 			//
 			// Returning an error in provisioning will cause the scheduler to retry and potentially
 			// (but not guaranteed) pick a different node.
+
+			// Add extra step to check the selectedNodeTopologies cache
+			if topology, ok := selectedNodeTopologies.Load(selectedCSINode.Name); ok {
+				topologyKeys = topology.([]string)
+			}
 			return nil, fmt.Errorf("no topology key found on CSINode %s", selectedCSINode.Name)
 		}
 
@@ -460,6 +474,16 @@ func getTopologyKeys(csiNode *storagev1.CSINode, driverName string) []string {
 		}
 	}
 	return nil
+}
+
+func getTopologyKeysFromAccessibleTopology(accessibleTopology []*csi.Topology) []string {
+	keys := []string{}
+	for _, topology := range accessibleTopology {
+		for k := range topology.Segments {
+			keys = append(keys, k)
+		}
+	}
+	return keys
 }
 
 func getTopologyFromNode(node *v1.Node, topologyKeys []string) (term topologyTerm, isMissingKey bool) {
