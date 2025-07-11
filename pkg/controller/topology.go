@@ -174,6 +174,9 @@ func GenerateAccessibilityRequirements(
 			//
 			// Returning an error in provisioning will cause the scheduler to retry and potentially
 			// (but not guaranteed) pick a different node.
+
+			// Add extra step to check the selectedNodeTopologies cache
+			// Add provisionController.SelectedNodeTopologies
 			return nil, fmt.Errorf("no topology key found on CSINode %s", selectedCSINode.Name)
 		}
 		var isMissingKey bool
@@ -345,6 +348,8 @@ func aggregateTopologies(
 			//
 			// Returning an error in provisioning will cause the scheduler to retry and potentially
 			// (but not guaranteed) pick a different node.
+
+			// Add extra step to check the selectedNodeTopologies cache
 			return nil, fmt.Errorf("no topology key found on CSINode %s", selectedCSINode.Name)
 		}
 

@@ -48,6 +48,7 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	corelistersv1 "k8s.io/client-go/listers/core/v1"
+	storagelistersv1 "k8s.io/client-go/listers/storage/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
@@ -122,6 +123,8 @@ type ProvisionController struct {
 	volumes        cache.Store
 	classInformer  cache.SharedInformer
 	nodeLister     corelistersv1.NodeLister
+	csiNodeLister  storagelistersv1.CSINodeLister
+	scLister       storagelistersv1.StorageClassLister
 	classes        cache.Store
 
 	// To determine if the informer is internal or external
@@ -179,6 +182,9 @@ type ProvisionController struct {
 
 	// Map UID -> *PVC with all claims that may be provisioned in the background.
 	claimsInProgress sync.Map
+
+	// Map nodeName to topologies
+	selectedNodeTopologies sync.Map
 
 	volumeStore VolumeStore
 
@@ -1114,6 +1120,26 @@ func (ctrl *ProvisionController) syncClaim(ctx context.Context, obj interface{})
 			// Provisioning is in progress in background.
 			logger.V(2).Info("Temporary error received, adding PVC to claims in progress", "claimUID", claim.UID)
 			ctrl.claimsInProgress.Store(string(claim.UID), claim)
+			// ctrl.claimsInProgress.Store(string(claim.UID), claim)
+			if selectedNodeName, ok := getString(claim.Annotations, annSelectedNode, annAlphaSelectedNode); ok {
+				selectedCSINode, err := ctrl.csiNodeLister.Get(selectedNodeName)
+				// OR should we make it non blocking ?
+				if err != nil {
+					// We don't want to fallback and provision in the wrong topology if there's some temporary
+					// error with the API server.
+					return fmt.Errorf("error getting CSINode for selected node %q: %v", selectedNodeName, err)
+				}
+				if selectedCSINode == nil {
+					return fmt.Errorf("CSINode for selected node %q not found", selectedNodeName)
+				}
+				storageClass, err := ctrl.scLister.Get(*claim.Spec.StorageClassName)
+				if err != nil {
+					return fmt.Errorf("error getting storageClass for claim %q: %v", claim.Name, err)
+				}
+				driverName := storageClass.Provisioner
+				topologyKeys := getTopologyKeys(selectedCSINode, driverName)
+				ctrl.selectedNodeTopologies.Store(selectedNodeName, topologyKeys)
+			}
 		} else {
 			// status == ProvisioningNoChange.
 			// Don't change claimsInProgress:
@@ -1718,4 +1744,13 @@ func getString(m map[string]string, key string, alts ...string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func getTopologyKeys(csiNode *storage.CSINode, driverName string) []string {
+	for _, driver := range csiNode.Spec.Drivers {
+		if driver.Name == driverName {
+			return driver.TopologyKeys
+		}
+	}
+	return nil
 }
