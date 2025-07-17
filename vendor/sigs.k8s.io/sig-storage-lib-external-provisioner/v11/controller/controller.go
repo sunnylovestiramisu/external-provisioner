@@ -184,7 +184,7 @@ type ProvisionController struct {
 	claimsInProgress sync.Map
 
 	// Map nodeName to topologies
-	selectedNodeTopologies sync.Map
+	SelectedNodeTopologies sync.Map
 
 	volumeStore VolumeStore
 
@@ -1138,7 +1138,7 @@ func (ctrl *ProvisionController) syncClaim(ctx context.Context, obj interface{})
 				}
 				driverName := storageClass.Provisioner
 				topologyKeys := getTopologyKeys(selectedCSINode, driverName)
-				ctrl.selectedNodeTopologies.Store(selectedNodeName, topologyKeys)
+				ctrl.SelectedNodeTopologies.Store(selectedNodeName, topologyKeys)
 			}
 		} else {
 			// status == ProvisioningNoChange.

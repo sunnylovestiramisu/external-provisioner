@@ -23,6 +23,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/kubernetes-csi/csi-lib-utils/rpc"
@@ -147,7 +148,8 @@ func GenerateAccessibilityRequirements(
 	strictTopology bool,
 	immediateTopology bool,
 	csiNodeLister storagelistersv1.CSINodeLister,
-	nodeLister corelisters.NodeLister) (*csi.TopologyRequirement, error) {
+	nodeLister corelisters.NodeLister,
+	selectedNodeTopologies *sync.Map) (*csi.TopologyRequirement, error) {
 	requirement := &csi.TopologyRequirement{}
 
 	var (
@@ -176,8 +178,11 @@ func GenerateAccessibilityRequirements(
 			// (but not guaranteed) pick a different node.
 
 			// Add extra step to check the selectedNodeTopologies cache
-			// Add provisionController.SelectedNodeTopologies
-			return nil, fmt.Errorf("no topology key found on CSINode %s", selectedCSINode.Name)
+			if topology, ok := selectedNodeTopologies.Load(selectedNode.Name); ok {
+				topologyKeys = topology.([]string)
+			} else {
+				return nil, fmt.Errorf("no topology key found on CSINode %s", selectedCSINode.Name)
+			}
 		}
 		var isMissingKey bool
 		selectedTopology, isMissingKey = getTopologyFromNode(selectedNode, topologyKeys)
@@ -465,6 +470,16 @@ func getTopologyKeys(csiNode *storagev1.CSINode, driverName string) []string {
 		}
 	}
 	return nil
+}
+
+func getTopologyKeysFromAccessibleTopology(accessibleTopology []*csi.Topology) []string {
+	keys := []string{}
+	for _, topology := range accessibleTopology {
+		for k := range topology.Segments {
+			keys = append(keys, k)
+		}
+	}
+	return keys
 }
 
 func getTopologyFromNode(node *v1.Node, topologyKeys []string) (term topologyTerm, isMissingKey bool) {
