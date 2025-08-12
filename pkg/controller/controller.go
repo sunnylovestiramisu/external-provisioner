@@ -278,6 +278,7 @@ type csiProvisioner struct {
 	nodeDeployment                        *internalNodeDeployment
 	controllerPublishReadOnly             bool
 	preventVolumeModeConversion           bool
+	claimInformer                         cache.SharedIndexInformer
 }
 
 var (
@@ -359,6 +360,7 @@ func NewCSIProvisioner(client kubernetes.Interface,
 	nodeDeployment *NodeDeployment,
 	controllerPublishReadOnly bool,
 	preventVolumeModeConversion bool,
+	claimInformer cache.SharedIndexInformer,
 ) controller.Provisioner {
 	broadcaster := record.NewBroadcaster()
 	broadcaster.StartLogging(klog.Infof)
@@ -394,6 +396,7 @@ func NewCSIProvisioner(client kubernetes.Interface,
 		eventRecorder:                         eventRecorder,
 		controllerPublishReadOnly:             controllerPublishReadOnly,
 		preventVolumeModeConversion:           preventVolumeModeConversion,
+		claimInformer:                         claimLister.Informer(),
 	}
 	if nodeDeployment != nil {
 		provisioner.nodeDeployment = &internalNodeDeployment{
@@ -813,7 +816,29 @@ func (p *csiProvisioner) Provision(ctx context.Context, options controller.Provi
 		}
 	}
 
-	result, state, err := p.prepareProvision(ctx, claim, options.StorageClass, options.SelectedNode)
+	// Add logic to check if node exists
+	var selectedNode *v1.Node
+	if len(options.SelectedNodeName) > 0 {
+		if p.nodeLister != nil {
+			selectedNode, err = p.nodeLister.Get(options.SelectedNodeName)
+		} else {
+			selectedNode, err = p.client.CoreV1().Nodes().Get(ctx, options.SelectedNodeName, metav1.GetOptions{}) // TODO (verult) cache Nodes
+		}
+		if err != nil {
+			// if node does not exist, reschedule and remove volume.kubernetes.io/selected-node annotation
+			if apierrors.IsNotFound(err) {
+				ctx2 := klog.NewContext(ctx, klog.FromContext(ctx))
+				returnState, err := p.provisionVolumeErrorHandling(ctx2, controller.ProvisioningReschedule, err, claim)
+				return nil, returnState, err
+			}
+			err = fmt.Errorf("failed to get target node: %v", err)
+			p.eventRecorder.Event(claim, v1.EventTypeWarning, "ProvisioningFailed", err.Error())
+			return nil, controller.ProvisioningNoChange, err
+		}
+
+	}
+
+	result, state, err := p.prepareProvision(ctx, claim, options.StorageClass, selectedNode)
 	if result == nil {
 		return nil, state, err
 	}
@@ -1987,4 +2012,67 @@ func (p *csiProvisioner) dataSource(ctx context.Context, claim *v1.PersistentVol
 	}
 
 	return &dataSource, nil
+}
+
+func (p *csiProvisioner) provisionVolumeErrorHandling(ctx context.Context, result controller.ProvisioningState, err error, claim *v1.PersistentVolumeClaim) (controller.ProvisioningState, error) {
+	logger := klog.FromContext(ctx)
+	p.eventRecorder.Event(claim, v1.EventTypeWarning, "ProvisioningFailed", err.Error())
+	if _, ok := claim.Annotations[annSelectedNode]; ok && result == controller.ProvisioningReschedule {
+		// For dynamic PV provisioning with delayed binding, the provisioner may fail
+		// because the node is wrong (permanent error) or currently unusable (not enough
+		// capacity). If the provisioner wants to give up scheduling with the currently
+		// selected node, then it can ask for that by returning ProvisioningReschedule
+		// as state.
+		//
+		// `selectedNode` must be removed to notify scheduler to schedule again.
+		if errLabel := p.rescheduleProvisioning(ctx, claim); errLabel != nil {
+			logger.Info("Volume rescheduling failed", "err", errLabel)
+			// If unsetting that label fails in ctrl.rescheduleProvisioning, we
+			// keep the volume in the work queue as if the provisioner had
+			// returned ProvisioningFinished and simply try again later.
+			return controller.ProvisioningFinished, err
+		}
+		// Label was removed, stop working on the volume.
+		logger.V(2).Info("Volume rescheduled because", "err", err)
+		return controller.ProvisioningFinished, errors.New("stop provisioning")
+	}
+
+	// ProvisioningReschedule shouldn't have been returned for volumes without selected node,
+	// but if we get it anyway, then treat it like ProvisioningFinished because we cannot
+	// reschedule.
+	if result == controller.ProvisioningReschedule {
+		result = controller.ProvisioningFinished
+	}
+	return result, err
+}
+
+// rescheduleProvisioning signal back to the scheduler to retry dynamic provisioning
+// by removing the annSelectedNode annotation
+func (p *csiProvisioner) rescheduleProvisioning(ctx context.Context, claim *v1.PersistentVolumeClaim) error {
+	if _, ok := claim.Annotations[annSelectedNode]; !ok {
+		// Provisioning not triggered by the scheduler, skip
+		return nil
+	}
+
+	// The claim from method args can be pointing to watcher cache. We must not
+	// modify these, therefore create a copy.
+	newClaim := claim.DeepCopy()
+	delete(newClaim.Annotations, annSelectedNode)
+	// Try to update the PVC object
+	if _, err := p.client.CoreV1().PersistentVolumeClaims(newClaim.Namespace).Update(ctx, newClaim, metav1.UpdateOptions{}); err != nil {
+		return fmt.Errorf("delete annotation 'annSelectedNode' for PersistentVolumeClaim %q: %v", klog.KObj(newClaim), err)
+	}
+
+	// Save updated claim into informer cache to avoid operations on old claim.
+	if err := p.claimInformer.GetStore().Update(newClaim); err != nil {
+		// This shouldn't happen because it is a local
+		// operation. The only situation in which Update fails
+		// is when the object is invalid, which isn't the case
+		// here
+		// (https://github.com/kubernetes/client-go/blob/eb0bad8167df60e402297b26e2cee1bddffde108/tools/cache/store.go#L154-L162).
+		// Log the error and hope that a regular cache update will resolve it.
+		klog.FromContext(ctx).Info("Update claim informer cache for PersistentVolumeClaim", "PVC", klog.KObj(newClaim), "err", err)
+	}
+
+	return nil
 }
