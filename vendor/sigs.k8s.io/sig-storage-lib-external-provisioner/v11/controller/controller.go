@@ -1486,31 +1486,19 @@ func (ctrl *ProvisionController) provisionClaimOperation(ctx context.Context, cl
 		return ProvisioningFinished, errStopProvision
 	}
 
-	var selectedNode *v1.Node
+	var selectedNodeName string
 	// Get SelectedNode
 	if nodeName, ok := getString(claim.Annotations, annSelectedNode, annAlphaSelectedNode); ok {
-		if ctrl.nodeLister != nil {
-			selectedNode, err = ctrl.nodeLister.Get(nodeName)
-		} else {
-			selectedNode, err = ctrl.client.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{}) // TODO (verult) cache Nodes
-		}
-		if err != nil {
-			// if node does not exist, reschedule and remove volume.kubernetes.io/selected-node annotation
-			if apierrs.IsNotFound(err) {
-				ctx2 := klog.NewContext(ctx, logger)
-				return ctrl.provisionVolumeErrorHandling(ctx2, ProvisioningReschedule, err, claim)
-			}
-			err = fmt.Errorf("failed to get target node: %v", err)
-			ctrl.eventRecorder.Event(claim, v1.EventTypeWarning, "ProvisioningFailed", err.Error())
-			return ProvisioningNoChange, err
-		}
+		selectedNodeName = nodeName
+	} else {
+		logger.Info("======== No selected node annotation ========")
 	}
 
 	options := ProvisionOptions{
-		StorageClass: class,
-		PVName:       pvName,
-		PVC:          claim,
-		SelectedNode: selectedNode,
+		StorageClass:     class,
+		PVName:           pvName,
+		PVC:              claim,
+		SelectedNodeName: selectedNodeName,
 	}
 
 	ctrl.eventRecorder.Event(claim, v1.EventTypeNormal, "Provisioning", fmt.Sprintf("External provisioner is provisioning volume for claim %q", klog.KObj(claim)))
