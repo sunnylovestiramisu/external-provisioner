@@ -17,6 +17,8 @@ limitations under the License.
 package controller
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"math/rand"
@@ -29,6 +31,7 @@ import (
 	"github.com/kubernetes-csi/external-provisioner/v5/pkg/features"
 	v1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
@@ -141,13 +144,15 @@ func SupportsTopology(pluginCapabilities rpc.PluginCapabilitySet) bool {
 func GenerateAccessibilityRequirements(
 	kubeClient kubernetes.Interface,
 	driverName string,
+	pvcNamespace string,
 	pvcName string,
 	allowedTopologies []v1.TopologySelectorTerm,
-	selectedNode *v1.Node,
+	selectedNodeName string,
 	strictTopology bool,
 	immediateTopology bool,
 	csiNodeLister storagelistersv1.CSINodeLister,
-	nodeLister corelisters.NodeLister) (*csi.TopologyRequirement, error) {
+	nodeLister corelisters.NodeLister,
+	claimLister corelisters.PersistentVolumeClaimLister) (*csi.TopologyRequirement, error) {
 	requirement := &csi.TopologyRequirement{}
 
 	var (
@@ -158,12 +163,19 @@ func GenerateAccessibilityRequirements(
 	)
 
 	// 1. Get CSINode for the selected node
-	if selectedNode != nil {
-		selectedCSINode, err = getSelectedCSINode(csiNodeLister, selectedNode)
+	if len(selectedNodeName) > 0 {
+		selectedCSINode, err = getSelectedCSINode(csiNodeLister, selectedNodeName)
 		if err != nil {
 			return nil, err
 		}
 		topologyKeys := getTopologyKeys(selectedCSINode, driverName)
+		// Get PVC
+		claim, err := claimLister.PersistentVolumeClaims(pvcNamespace).Get(pvcName)
+		if err != nil {
+			return nil, err
+		}
+		annotationKeyNode := "topology.csi." + driverName + "/cached-node-labels"
+		annottionKeyCsiNode := "topology.csi." + driverName + "/cached-csi-node-topologies"
 		if len(topologyKeys) == 0 {
 			// The scheduler selected a node with no topology information.
 			// This can happen if:
@@ -174,12 +186,45 @@ func GenerateAccessibilityRequirements(
 			//
 			// Returning an error in provisioning will cause the scheduler to retry and potentially
 			// (but not guaranteed) pick a different node.
-			return nil, fmt.Errorf("no topology key found on CSINode %s", selectedCSINode.Name)
+
+			// Check the cache in annotation
+			if claim.Annotations != nil && len(claim.Annotations[annottionKeyCsiNode]) > 0 {
+				err = json.Unmarshal([]byte(claim.Annotations[annottionKeyCsiNode]), &topologyKeys)
+				if err != nil {
+					return nil, err
+				}
+				if len(topologyKeys) == 0 {
+					return nil, fmt.Errorf("no topology key found on CSINode %s", selectedCSINode.Name)
+				}
+			}
+		} else {
+			// Add or update to the PVC annotation for both node and csiNode
+			if claim.Annotations == nil {
+				claim.Annotations = make(map[string]string)
+			}
+			// store topologyKeys
+			jsonBytes, err := json.Marshal(topologyKeys)
+			if err != nil {
+				return nil, err
+			}
+			// Convert the byte slice to a string.
+			jsonString := string(jsonBytes)
+			// Always update the annotation for simplicity
+			claim.Annotations[annottionKeyCsiNode] = jsonString
+
+			if _, err = kubeClient.CoreV1().PersistentVolumeClaims(claim.Namespace).Update(context.Background(), claim, metav1.UpdateOptions{}); err != nil {
+				if !apierrors.IsNotFound(err) {
+					// Couldn't remove finalizer and the object still exists, the controller may
+					// try to remove the finalizer again on the next update
+					klog.Infof("failed to update clone finalizer from PVC %v", claim.Name)
+					return nil, err
+				}
+			}
 		}
 		var isMissingKey bool
-		selectedTopology, isMissingKey = getTopologyFromNode(selectedNode, topologyKeys)
+		selectedTopology, selectedNodeLabels, isMissingKey := getTopologyFromNodeName(selectedNodeName, annotationKeyNode, topologyKeys, nodeLister, claim)
 		if isMissingKey {
-			return nil, fmt.Errorf("topology labels from selected node %v does not match topology keys from CSINode %v", selectedNode.Labels, topologyKeys)
+			return nil, fmt.Errorf("topology labels from selected node %v does not match topology keys from CSINode %v", selectedNodeLabels, topologyKeys)
 		}
 
 		if strictTopology {
@@ -194,7 +239,7 @@ func GenerateAccessibilityRequirements(
 					}
 				}
 				if !found {
-					return nil, fmt.Errorf("selected node '%q' topology '%v' is not in allowed topologies: %v", selectedNode.Name, selectedTopology, allowedTopologiesFlatten)
+					return nil, fmt.Errorf("selected node '%q' topology '%v' is not in allowed topologies: %v", selectedNodeName, selectedTopology, allowedTopologiesFlatten)
 				}
 			}
 			// Only pass topology of selected node.
@@ -208,7 +253,7 @@ func GenerateAccessibilityRequirements(
 			// Distribute out one of the OR layers in allowedTopologies
 			requisiteTerms = flatten(allowedTopologies)
 		} else {
-			if selectedNode == nil && !immediateTopology {
+			if len(selectedNodeName) == 0 && !immediateTopology {
 				// Don't specify any topology requirements because neither the PVC nor
 				// the storage class have limitations and the CSI driver is not interested
 				// in being told where it runs (perhaps it already knows, for example).
@@ -269,7 +314,7 @@ func GenerateAccessibilityRequirements(
 				//   constraint.
 				// - Otherwise, the aggregated topology is guaranteed to contain topology information from the
 				//   selected node.
-				return nil, fmt.Errorf("topology %v from selected node %q is not in requisite: %v", selectedTopology, selectedNode.Name, requisiteTerms)
+				return nil, fmt.Errorf("topology %v from selected node %q is not in requisite: %v", selectedTopology, selectedNodeName, requisiteTerms)
 			}
 		}
 	}
@@ -280,16 +325,16 @@ func GenerateAccessibilityRequirements(
 // getSelectedCSINode returns the CSINode object for the given selectedNode.
 func getSelectedCSINode(
 	csiNodeLister storagelistersv1.CSINodeLister,
-	selectedNode *v1.Node) (*storagev1.CSINode, error) {
+	selectedNodeName string) (*storagev1.CSINode, error) {
 
-	selectedCSINode, err := csiNodeLister.Get(selectedNode.Name)
+	selectedCSINode, err := csiNodeLister.Get(selectedNodeName)
 	if err != nil {
 		// We don't want to fallback and provision in the wrong topology if there's some temporary
 		// error with the API server.
-		return nil, fmt.Errorf("error getting CSINode for selected node %q: %v", selectedNode.Name, err)
+		return nil, fmt.Errorf("error getting CSINode for selected node %q: %v", selectedNodeName, err)
 	}
 	if selectedCSINode == nil {
-		return nil, fmt.Errorf("CSINode for selected node %q not found", selectedNode.Name)
+		return nil, fmt.Errorf("CSINode for selected node %q not found", selectedNodeName)
 	}
 	return selectedCSINode, nil
 }
@@ -462,8 +507,40 @@ func getTopologyKeys(csiNode *storagev1.CSINode, driverName string) []string {
 	return nil
 }
 
+func getTopologyFromNodeName(nodeName string, annotationKeyNode string, topologyKeys []string, nodeLister corelisters.NodeLister, pvc *v1.PersistentVolumeClaim) (term topologyTerm, selectedNodeLabels map[string]string, isMissingKey bool) {
+	term = make(topologyTerm, 0, len(topologyKeys))
+	// Get Node Here
+	var node *v1.Node
+	if nodeLister != nil {
+		node, err := nodeLister.Get(nodeName)
+		if err != nil {
+			return nil, nil, true
+		}
+		if node == nil {
+			// Read from the annotation cache
+			if pvc.Annotations != nil && len(pvc.Annotations[annotationKeyNode]) > 0 {
+				err = json.Unmarshal([]byte(pvc.Annotations[annotationKeyNode]), &node)
+				if err != nil {
+					return nil, nil, true
+				}
+			}
+		}
+	}
+
+	for _, key := range topologyKeys {
+		v, ok := node.Labels[key]
+		if !ok {
+			return nil, nil, true
+		}
+		term = append(term, topologySegment{key, v})
+	}
+	term.sort()
+	return term, node.Labels, false
+}
+
 func getTopologyFromNode(node *v1.Node, topologyKeys []string) (term topologyTerm, isMissingKey bool) {
 	term = make(topologyTerm, 0, len(topologyKeys))
+	// Get Node Here
 	for _, key := range topologyKeys {
 		v, ok := node.Labels[key]
 		if !ok {
