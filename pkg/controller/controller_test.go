@@ -19,13 +19,14 @@ package controller
 import (
 	"context"
 	"fmt"
-	"github.com/go-logr/logr"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/go-logr/logr"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/golang/mock/gomock"
@@ -2092,7 +2093,7 @@ func provisionTestcases() (int64, map[string]provisioningTestcase) {
 		"distributed, right node selected": {
 			deploymentNode: "foo",
 			volOpts: controller.ProvisionOptions{
-				SelectedNode: nodeFoo,
+				SelectedNodeName: nodeFoo.Name,
 				StorageClass: &storagev1.StorageClass{
 					ObjectMeta: metav1.ObjectMeta{
 						Name: fakeSCName,
@@ -2148,7 +2149,7 @@ func provisionTestcases() (int64, map[string]provisioningTestcase) {
 		"distributed, wrong node selected": {
 			deploymentNode: "foo",
 			volOpts: controller.ProvisionOptions{
-				SelectedNode: nodeBar,
+				SelectedNodeName: nodeBar.Name,
 				StorageClass: &storagev1.StorageClass{
 					ObjectMeta: metav1.ObjectMeta{
 						Name: fakeSCName,
@@ -2173,7 +2174,7 @@ func provisionTestcases() (int64, map[string]provisioningTestcase) {
 			deploymentNode:   "foo",
 			immediateBinding: true,
 			volOpts: controller.ProvisionOptions{
-				SelectedNode: nodeFoo,
+				SelectedNodeName: nodeFoo.Name,
 				StorageClass: &storagev1.StorageClass{
 					ObjectMeta: metav1.ObjectMeta{
 						Name: fakeSCName,
@@ -2691,6 +2692,7 @@ func runProvisionTest(t *testing.T, tc provisioningTestcase, requestedBytes int6
 	objects := tc.clientSetObjects
 	var node *v1.Node
 	var csiNode *storagev1.CSINode
+	var pvc *v1.PersistentVolumeClaim
 	if tc.deploymentNode != "" {
 		node = &v1.Node{
 			ObjectMeta: metav1.ObjectMeta{
@@ -2714,7 +2716,8 @@ func runProvisionTest(t *testing.T, tc provisioningTestcase, requestedBytes int6
 				},
 			},
 		}
-		objects = append(objects, node, csiNode)
+		pvc = &v1.PersistentVolumeClaim{}
+		objects = append(objects, node, csiNode, pvc)
 	}
 	if tc.volOpts.PVC != nil {
 		tc.volOpts.PVC = tc.volOpts.PVC.DeepCopy()
@@ -2752,7 +2755,7 @@ func runProvisionTest(t *testing.T, tc provisioningTestcase, requestedBytes int6
 	}
 	mycontrollerPublishReadOnly := tc.controllerPublishReadOnly
 	csiProvisioner := NewCSIProvisioner(clientSet, 5*time.Second, "test-provisioner", "test", 5, csiConn.conn,
-		nil, provisionDriverName, pluginCaps, controllerCaps, supportsMigrationFromInTreePluginName, false, true, csitrans.New(), scInformer.Lister(), csiNodeInformer.Lister(), nodeInformer.Lister(), nil, nil, nil, tc.withExtraMetadata, defaultfsType, nodeDeployment, mycontrollerPublishReadOnly, false)
+		nil, provisionDriverName, pluginCaps, controllerCaps, supportsMigrationFromInTreePluginName, false, true, csitrans.New(), scInformer.Lister(), csiNodeInformer.Lister(), nodeInformer.Lister(), claimInformer.Lister(), nil, nil, tc.withExtraMetadata, defaultfsType, nodeDeployment, mycontrollerPublishReadOnly, false)
 
 	// Adding objects to the informer ensures that they are consistent with
 	// the fake storage without having to start the informers.
@@ -4822,7 +4825,7 @@ func TestProvisionErrorHandling(t *testing.T) {
 						PVC:          createFakePVC(requestBytes),
 					}
 					if nodeSelected {
-						options.SelectedNode = &nodes.Items[0]
+						options.SelectedNodeName = nodes.Items[0].Name
 					}
 					pv, state, err := csiProvisioner.Provision(context.Background(), options)
 
@@ -4901,13 +4904,9 @@ func TestProvisionWithTopologyDisabled(t *testing.T) {
 	controllerServer.EXPECT().CreateVolume(gomock.Any(), gomock.Any()).Return(out, nil).Times(1)
 
 	pv, _, err := csiProvisioner.Provision(context.Background(), controller.ProvisionOptions{
-		StorageClass: &storagev1.StorageClass{},
-		PVC:          createFakePVC(requestBytes),
-		SelectedNode: &v1.Node{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: "some-node",
-			},
-		},
+		StorageClass:     &storagev1.StorageClass{},
+		PVC:              createFakePVC(requestBytes),
+		SelectedNodeName: "some-node",
 	})
 	if err != nil {
 		t.Fatalf("got error from Provision call: %v", err)
