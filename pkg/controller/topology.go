@@ -231,10 +231,13 @@ func GenerateAccessibilityRequirements(
 		}
 	}
 
+	klog.Infof("======== Get topology keys for the selected node %v ========", requisiteTerms)
+
 	// 2. Generate CSI Requisite Terms
 	if len(requisiteTerms) == 0 {
 		if len(allowedTopologies) != 0 {
 			// Distribute out one of the OR layers in allowedTopologies
+			klog.Infof("======== allowedTopologies %v ========", allowedTopologies)
 			requisiteTerms = flatten(allowedTopologies)
 		} else {
 			if len(selectedNodeName) == 0 && !immediateTopology {
@@ -256,6 +259,7 @@ func GenerateAccessibilityRequirements(
 				return nil, fmt.Errorf("no available topology found")
 			}
 		}
+		klog.Infof("======== Generate CSI Requisite Terms %v ========", requisiteTerms)
 	}
 
 	// It might be possible to reach here if allowedTopologies had empty entries.
@@ -284,6 +288,8 @@ func GenerateAccessibilityRequirements(
 			if len(preferredTerms) > 0 {
 				pvcNodeStore.UpdatePreferredTerms(pvcUID, preferredTerms)
 			}
+		} else {
+			klog.Infof("======== Immediate binding preferredTerms %v ========", preferredTerms)
 		}
 
 	} else {
@@ -291,10 +297,12 @@ func GenerateAccessibilityRequirements(
 		if strictTopology {
 			// In case of strict topology, preferred = requisite
 			preferredTerms = requisiteTerms
+			klog.Infof("======== Strict topology, preferredTerms %v ========", preferredTerms)
 		} else {
 			// Read from cache first to make sure retry with the same arguments
 			preferredTerms, err = getPreferredTermsFromCache(pvcNodeStore, pvcUID)
 			if err != nil || len(preferredTerms) == 0 {
+				klog.Infof("======== requisiteTerms is %v, selectedTopology is %v ========", requisiteTerms, selectedTopology)
 				for i, t := range requisiteTerms {
 					if t.subset(selectedTopology) {
 						preferredTerms = append(requisiteTerms[i:], requisiteTerms[:i]...)
@@ -302,8 +310,11 @@ func GenerateAccessibilityRequirements(
 					}
 				}
 				if len(preferredTerms) > 0 {
+					klog.Infof("======== UpdatePreferredTerms %v ========", preferredTerms)
 					pvcNodeStore.UpdatePreferredTerms(pvcUID, preferredTerms)
 				}
+			} else {
+				klog.Infof("======== Delayed binding preferredTerms %v ========", preferredTerms)
 			}
 			if len(preferredTerms) == 0 {
 				// Topology from selected node is not in requisite. This case should never be hit:
